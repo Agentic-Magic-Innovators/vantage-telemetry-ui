@@ -1,0 +1,17 @@
+version: "3.9"
+
+# Standalone telemetry UI (nginx static site).
+# Points at telemetry-service API — deploy separately from backend.
+#
+#   docker compose up -d --build
+#   http://localhost:50226
+
+services:
+  telemetry-ui:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${VANTAGE_TELEMETRY_UI_PORT:-50226}:80"
+    environment:
+      VANTAGE_TELEMETRY_URL: ${VANTAGE_TELEMETRY_URL:-http://localhost:50224}
+      VANTAGE_UI_MODE: standalone
