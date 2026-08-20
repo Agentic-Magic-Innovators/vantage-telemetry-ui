@@ -28,13 +28,81 @@ function _wireEmailForm() {
                     _onAuthSuccess();
                 } else {
                     const err = await res.json().catch(() => ({}));
-                    _showAuthError('google', err.detail || 'Login failed');
+                    _handleAuthFailure('google', err.detail);
                 }
             } catch {
                 _showAuthError('google', 'Network error — is the harness running?');
             } finally {
                 btn.disabled = false;
                 btn.textContent = 'Sign in as User';
+            }
+        });
+    }
+}
+
+// A failed "user" login is either a real error, or someone who simply
+// hasn't registered yet — the latter should point them at Request access
+// instead of reading as a dead end.
+function _handleAuthFailure(type, detail) {
+    if (detail === 'not_registered') {
+        _showAuthError(type, "This email hasn't been registered yet — request access below.");
+        _revealRegisterForm();
+        return;
+    }
+    _showAuthError(type, detail || 'Login failed');
+}
+
+function _revealRegisterForm() {
+    document.getElementById('register-form')?.classList.remove('hidden');
+    document.getElementById('show-register-btn')?.classList.add('hidden');
+}
+
+function _wireRegisterForm() {
+    const showBtn = document.getElementById('show-register-btn');
+    if (showBtn && !showBtn.dataset.wired) {
+        showBtn.dataset.wired = '1';
+        showBtn.addEventListener('click', () => _revealRegisterForm());
+    }
+
+    const form = document.getElementById('register-form');
+    if (form && !form.dataset.wired) {
+        form.dataset.wired = '1';
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const errEl = document.getElementById('register-error');
+            const okEl = document.getElementById('register-success');
+            errEl.classList.add('hidden');
+            okEl.classList.add('hidden');
+            const btn = form.querySelector('button[type="submit"]');
+            btn.disabled = true;
+            btn.textContent = 'Submitting…';
+            try {
+                const res = await _fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        email: document.getElementById('register-email').value,
+                        name: document.getElementById('register-name').value,
+                    }),
+                });
+                const body = await res.json().catch(() => ({}));
+                if (res.ok) {
+                    const msg = body.status === 'approved'
+                        ? "You're already approved — sign in above."
+                        : "Request submitted. An admin will review it, and you'll be able to sign in once approved.";
+                    okEl.textContent = msg;
+                    okEl.classList.remove('hidden');
+                    form.reset();
+                } else {
+                    errEl.textContent = body.detail || 'Could not submit request.';
+                    errEl.classList.remove('hidden');
+                }
+            } catch {
+                errEl.textContent = 'Network error — is the telemetry service running?';
+                errEl.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Request access';
             }
         });
     }
@@ -128,7 +196,7 @@ async function _handleGoogleCredential(credentialResponse) {
             _onAuthSuccess();
         } else {
             const err = await res.json().catch(() => ({}));
-            _showAuthError('google', err.detail || 'Google login failed');
+            _handleAuthFailure('google', err.detail);
         }
     } catch {
         _showAuthError('google', 'Network error — is the harness running?');
@@ -137,6 +205,7 @@ async function _handleGoogleCredential(credentialResponse) {
 
 function _showLoginScreen() {
     document.getElementById('login-overlay').classList.remove('hidden');
+    _wireRegisterForm();
 
     // Wire up login tab switching
     document.querySelectorAll('.login-tab').forEach(btn => {
@@ -216,8 +285,74 @@ function _onAuthSuccess() {
         initMyTokenSection();
     } else {
         document.getElementById('my-token-section')?.classList.add('hidden');
+        loadAccessRequests();
     }
 }
+
+// =============================================================================
+// Access Requests (admin) — approve/reject new user registrations
+// =============================================================================
+
+async function loadAccessRequests() {
+    if (currentUser?.role !== 'admin') return;
+    const tbody = document.querySelector('#access-requests-table tbody');
+    const emptyEl = document.getElementById('access-requests-empty');
+    if (!tbody) return;
+    try {
+        const res = await _fetch('/api/auth/admin/pending-users');
+        if (!res.ok) return;
+        const { users } = await res.json();
+        tbody.innerHTML = '';
+        if (!users.length) {
+            emptyEl?.classList.remove('hidden');
+            return;
+        }
+        emptyEl?.classList.add('hidden');
+        for (const u of users) {
+            const tr = document.createElement('tr');
+            const requested = u.requestedAt ? new Date(u.requestedAt).toLocaleString() : '—';
+            tr.innerHTML = `
+                <td>${escapeHtml(u.email)}</td>
+                <td>${escapeHtml(u.name || '—')}</td>
+                <td>${escapeHtml(requested)}</td>
+                <td>
+                    <button class="btn-approve" data-action="approve" data-email="${escapeHtml(u.email)}">Approve</button>
+                    <button class="btn-reject" data-action="reject" data-email="${escapeHtml(u.email)}">Reject</button>
+                </td>
+            `;
+            tbody.appendChild(tr);
+        }
+    } catch (err) {
+        console.error('Failed to load access requests:', err);
+    }
+}
+
+document.addEventListener('click', async (e) => {
+    const btn = e.target.closest('#access-requests-table [data-action]');
+    if (!btn) return;
+    const email = btn.dataset.email;
+    const action = btn.dataset.action;
+    btn.disabled = true;
+    try {
+        const res = await _fetch(`/api/auth/admin/users/${encodeURIComponent(email)}/${action}`, { method: 'POST' });
+        if (res.ok) {
+            loadAccessRequests();
+        } else {
+            const err = await res.json().catch(() => ({}));
+            alert(err.detail || `Could not ${action} ${email}`);
+            btn.disabled = false;
+        }
+    } catch {
+        alert('Network error — is the telemetry service running?');
+        btn.disabled = false;
+    }
+});
+
+document.addEventListener('click', (e) => {
+    if (e.target.matches('.dashboard-tab-btn[data-target="tab-access-requests"]')) {
+        loadAccessRequests();
+    }
+});
 
 async function logout() {
     stopMetricsAutoRefresh();
@@ -236,8 +371,11 @@ async function logout() {
     const dashContent = document.getElementById('dashboard');
     if (dashBtn) dashBtn.classList.add('active');
     if (dashContent) dashContent.classList.add('active');
-    // Clear error messages
+    // Clear error/success messages and collapse the register form back down
     document.querySelectorAll('.login-error').forEach(el => el.classList.add('hidden'));
+    document.querySelectorAll('.login-success').forEach(el => el.classList.add('hidden'));
+    document.getElementById('register-form')?.classList.add('hidden');
+    document.getElementById('show-register-btn')?.classList.remove('hidden');
     document.getElementById('admin-password').value = '';
     _showLoginScreen();
     _initGoogleAuth();
@@ -544,6 +682,7 @@ function renderDashboard(data) {
     window.recentActivities = personalRecords(data.recent);
     window.auditActivities = personalRecords(data.audit);
     window.productivityActivities = personalRecords(data.productivity);
+    window.productivityCommits = personalRecords(data.productivityCommits || []);
     window.usageActivities = personalRecords(data.usage);
     window.costActivities = personalRecords(data.cost);
     window.cursorUsageActivities = personalRecords(data.cursorUsage);
@@ -841,6 +980,15 @@ function formatRawEventSummary(x) {
             return `Turn · ${x.turnType || 'unknown'}`;
         case 'productivity':
             return `Session · +${x.linesAdded || 0}/−${x.linesDeleted || 0} lines`;
+        case 'github_pr':
+        case 'pr_opened':
+        case 'pr_merged':
+        case 'pr_reviewed':
+        case 'pr_updated':
+        case 'pr_closed':
+            return `PR #${x.pullRequestId || x.prNumber || '?'} · ${x.title || x.prTitle || type.replace('pr_', '')}`;
+        case 'session_outcome':
+            return `Outcome · ${x.outcome || 'unknown'}${x.commitHash ? ` · ${String(x.commitHash).slice(0, 8)}` : ''}`;
         case 'search_performed':
             return `${x.searchMode || 'search'} · ${x.provider || 'unknown'} · ${truncateText(x.query || '', 40)}`;
         default:
@@ -990,46 +1138,75 @@ function renderAuditTable() {
     }
 }
 
+function buildProductivityFeed() {
+    const sessions = (window.productivityActivities || []).map((x) => ({
+        ...x,
+        rowKind: 'session',
+        sortTs: x.occurredAt || x.timestamp || '',
+    }));
+    const commits = (window.productivityCommits || []).map((x) => ({
+        ...x,
+        rowKind: 'commit',
+        sortTs: x.occurredAt || x.timestamp || '',
+    }));
+    return [...sessions, ...commits].sort((a, b) => String(b.sortTs).localeCompare(String(a.sortTs)));
+}
+
 function renderProductivityTable() {
     const tbody = document.querySelector('#productivity-table tbody');
-    if (!tbody || !window.productivityActivities) return;
+    if (!tbody) return;
 
     const searchQuery = (document.getElementById('productivity-search')?.value || '').toLowerCase().trim();
     const limit = getTelemetryLimit();
-    let list = [...window.productivityActivities];
+    let list = buildProductivityFeed();
 
     if (searchQuery) {
         list = list.filter((x) => {
             const files = Array.isArray(x.filesModifiedList) ? x.filesModifiedList.join(' ') : '';
+            const commitText = `${x.commitHash || ''} ${x.commitMessage || ''} ${x.branchName || ''}`;
             return (
                 (x.userId || '').toLowerCase().includes(searchQuery) ||
                 (x.teamId || '').toLowerCase().includes(searchQuery) ||
-                files.toLowerCase().includes(searchQuery)
+                files.toLowerCase().includes(searchQuery) ||
+                commitText.toLowerCase().includes(searchQuery)
             );
         });
     }
 
-    const reversed = applyLimit([...list].reverse(), limit);
+    const rows = applyLimit(list, limit);
 
-    if (reversed.length > 0) {
-        tbody.innerHTML = reversed.map((x) => {
+    if (rows.length > 0) {
+        tbody.innerHTML = rows.map((x) => {
+            const isCommit = x.rowKind === 'commit';
             const files = Array.isArray(x.filesModifiedList) ? x.filesModifiedList : [];
             const filePreview = files.length ? files.slice(0, 3).join(', ') + (files.length > 3 ? ` (+${files.length - 3} more)` : '') : '—';
+            const activeSec = x.activeCodingTimeSec ?? x.durationSec ?? x.activeSeconds;
+            const outcome = isCommit ? 'commit' : (x.outcome || '—');
+            const outcomeClass = outcome === 'committed' || outcome === 'commit' ? 'status-merged' : outcome === 'abandoned' ? 'status-closed' : '';
+            const commitHash = (x.commitHash || '').slice(0, 8);
+            const commitLabel = commitHash
+                ? `${commitHash}${x.commitMessage ? ` · ${truncateText(x.commitMessage, 48)}` : ''}`
+                : '—';
+            const linesAdded = isCommit ? (x.linesAdded || 0) : (x.linesAdded || 0);
+            const linesDeleted = isCommit ? (x.linesDeleted || 0) : (x.linesDeleted || 0);
             return `
                 <tr>
-                    <td>${formatTimestamp(x.timestamp)}</td>
+                    <td>${formatTimestamp(x.occurredAt || x.timestamp)}</td>
                     <td class="mono-cell">${escapeHtml(x.userId || '')}</td>
                     <td>${escapeHtml(x.teamId || '')}</td>
-                    <td>${x.activeCodingTimeSec != null ? `${x.activeCodingTimeSec}s` : '—'}</td>
-                    <td style="color: var(--route-local); font-weight: 600;">+${x.linesAdded || 0}</td>
-                    <td style="color: var(--warning); font-weight: 600;">−${x.linesDeleted || 0}</td>
-                    <td>${x.filesModifiedCount || files.length || 0}</td>
-                    <td class="details-cell">${escapeHtml(truncateText(filePreview, 120))}</td>
+                    <td><span class="badge-audit">${isCommit ? 'Commit' : 'Session'}</span></td>
+                    <td>${!isCommit && activeSec != null ? formatDuration(Number(activeSec) * 1000) : '—'}</td>
+                    <td style="color: var(--route-local); font-weight: 600;">+${linesAdded}</td>
+                    <td style="color: var(--warning); font-weight: 600;">−${linesDeleted}</td>
+                    <td>${outcome === '—' ? '—' : `<span class="status-pill ${outcomeClass}">${escapeHtml(outcome)}</span>`}</td>
+                    <td class="mono-cell details-cell">${escapeHtml(commitLabel)}</td>
+                    <td>${escapeHtml(x.branchName || '—')}</td>
+                    <td class="details-cell">${isCommit ? '—' : escapeHtml(truncateText(filePreview, 120))}</td>
                 </tr>
             `;
         }).join('');
     } else {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding: 2rem;">No productivity sessions yet — file edits in the watched workspace will appear here.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" style="text-align:center; padding: 2rem;">No productivity sessions or commits yet — file edits and git commits in the watched workspace will appear here.</td></tr>';
     }
 }
 
